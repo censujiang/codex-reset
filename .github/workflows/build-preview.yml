@@ -1,0 +1,58 @@
+name: Build and publish macOS preview
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-preview.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: codexreset-preview-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Test, build and publish macOS app
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show build environment
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Run regression tests
+        run: swift test -c release
+
+      - name: Package macOS app
+        run: |
+          mkdir -p "$RUNNER_TEMP/codexreset-install"
+          INSTALL_DIR="$RUNNER_TEMP/codexreset-install" ./make_app.sh
+          test -x "$RUNNER_TEMP/codexreset-install/CodexReset.app/Contents/MacOS/CodexReset"
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/codexreset-install/CodexReset.app"
+          ditto -c -k --keepParent "$RUNNER_TEMP/codexreset-install/CodexReset.app" "$RUNNER_TEMP/CodexReset-macOS-preview.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodexReset-macOS-preview
+          path: ${{ runner.temp }}/CodexReset-macOS-preview.zip
+
+      - name: Create prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: preview-${{ github.run_number }}
+        run: |
+          gh release create "$TAG" "$RUNNER_TEMP/CodexReset-macOS-preview.zip" \
+            --target "$GITHUB_SHA" \
+            --title "CodexReset macOS preview ($TAG)" \
+            --notes "Unofficial macOS test build from this fork at commit $GITHUB_SHA. Includes safe auto-resume fixes. Built on macOS, Swift tests passed, and the app bundle passed local codesign verification. Ad-hoc signed; not Apple notarized. Please validate manually before proposing an upstream PR." \
+            --prerelease
