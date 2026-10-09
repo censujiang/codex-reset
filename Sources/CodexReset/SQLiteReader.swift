@@ -65,6 +65,42 @@ final class SQLiteReader {
         return result
     }
 
+    /// Find selected conversations whose latest turn is still executing.
+    /// Query in batches to stay below SQLite's bind-parameter limit.
+    func activeThreadIds(for threadIds: Set<String>) -> Set<String> {
+        guard !threadIds.isEmpty else { return [] }
+        let ids = Array(threadIds).sorted()
+        var active = Set<String>()
+        for start in stride(from: 0, to: ids.count, by: 400) {
+            let batch = Array(ids[start..<min(start + 400, ids.count)])
+            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
+            let sql = """
+                SELECT t.thread_id, t.status
+                FROM thread_turns t
+                JOIN (
+                    SELECT thread_id, MAX(turn_id) AS latest_turn
+                    FROM thread_turns
+                    WHERE thread_id IN (\(placeholders))
+                    GROUP BY thread_id
+                ) m ON t.thread_id = m.thread_id AND t.turn_id = m.latest_turn
+                """
+            guard let rows = queryRows(path: threadHistoryPath, sql: sql, args: batch) else {
+                continue
+            }
+            for row in rows {
+                guard let threadId = row[0] as? String,
+                      let status = row[1] as? String else { continue }
+                switch status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+                case "inprogress", "in_progress", "running", "queued", "pending":
+                    active.insert(threadId)
+                default:
+                    break
+                }
+            }
+        }
+        return active
+    }
+
     /// 列出所有对话（含未暂停的），按项目分组用；过滤归档与子代理线程，最新在前
     func allThreads(limit: Int = 1000) -> [PausedThread] {
         guard let rows = queryRows(path: stateDbPath, sql: """
