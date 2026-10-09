@@ -50,6 +50,45 @@ final class ResumeSafetyTests: XCTestCase {
         XCTAssertFalse(relaunched.contains(threadId: "t", failedTurnId: "f1"))
     }
 
+    func testIdleSleepProtectionOnlyForOptedInSelectedWork() {
+        func check(_ enabled: Bool, _ auto: Bool, _ pending: Bool, _ running: Bool, _ sending: Bool = false) -> Bool {
+            IdleSleepPolicy.shouldPreventIdleSleep(
+                enabled: enabled,
+                autoContinueEnabled: auto,
+                hasSelectedQuotaFailure: pending,
+                hasSelectedRunningTurn: running,
+                isSendingContinue: sending
+            )
+        }
+        XCTAssertFalse(check(false, true, true, false))
+        XCTAssertFalse(check(true, false, true, false))
+        XCTAssertFalse(check(true, true, false, false))
+        XCTAssertTrue(check(true, true, true, false))
+        XCTAssertTrue(check(true, true, false, true))
+        XCTAssertTrue(check(true, true, false, false, true))
+        // All selected turns finished: the assertion must be released.
+        XCTAssertFalse(check(true, true, false, false))
+    }
+
+    func testActiveTurnDetectionUsesLatestTurnPerSelectedThread() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try executeSQL(at: home.appendingPathComponent("thread_history_1.sqlite"), """
+            CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, status TEXT, error_json TEXT, started_at INTEGER);
+            INSERT INTO thread_turns VALUES ('finished', '001', 'inProgress', NULL, 1);
+            INSERT INTO thread_turns VALUES ('finished', '002', 'completed', NULL, 2);
+            INSERT INTO thread_turns VALUES ('working', '003', 'inProgress', NULL, 3);
+            INSERT INTO thread_turns VALUES ('queued', '004', 'queued', NULL, 4);
+            INSERT INTO thread_turns VALUES ('failed', '005', 'failed', 'usageLimitExceeded', 5);
+            """)
+        let reader = SQLiteReader(codexHome: home.path)
+        XCTAssertEqual(reader.activeThreadIds(for: ["finished", "working", "queued", "failed"]),
+                       Set(["working", "queued"]))
+        XCTAssertEqual(reader.activeThreadIds(for: ["finished"]), [])
+        XCTAssertEqual(reader.activeThreadIds(for: []), [])
+    }
+
     private func executeSQL(at url: URL, _ sql: String) throws {
         var db: OpaquePointer?
         guard sqlite3_open(url.path, &db) == SQLITE_OK, let db else {
