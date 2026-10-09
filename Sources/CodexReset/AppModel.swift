@@ -22,16 +22,32 @@ final class AppModel: ObservableObject {
     @Published var allThreads: [PausedThread] = []
     /// 勾选、需要在恢复后自动继续的对话
     @Published var selectedThreadIds: Set<String> = [] {
-        didSet { UserDefaults.standard.set(Array(selectedThreadIds), forKey: "selectedThreadIds") }
+        didSet {
+            UserDefaults.standard.set(Array(selectedThreadIds), forKey: "selectedThreadIds")
+            updateIdleSleepPrevention()
+        }
     }
     @Published var logLines: [LogEntry] = []
     @Published var autoContinue: Bool {
-        didSet { UserDefaults.standard.set(autoContinue, forKey: "autoContinue") }
+        didSet {
+            UserDefaults.standard.set(autoContinue, forKey: "autoContinue")
+            updateIdleSleepPrevention()
+        }
     }
+    /// Optional, scoped idle-sleep protection. Off until the user opts in.
+    @Published var keepAwakeForSelectedTasks: Bool {
+        didSet {
+            UserDefaults.standard.set(keepAwakeForSelectedTasks, forKey: "keepAwakeForSelectedTasks")
+            updateIdleSleepPrevention()
+        }
+    }
+    @Published private(set) var idleSleepPreventionActive = false
     @Published var continueCommand: String {
         didSet { UserDefaults.standard.set(continueCommand, forKey: "continueCommand") }
     }
-    @Published var isWorking = false
+    @Published var isWorking = false {
+        didSet { updateIdleSleepPrevention() }
+    }
     @Published var remoteControlEnabled: Bool
     /// 语言设置：system / zh / en（切换后写回 UserDefaults 并通过 objectWillChange 触发界面刷新）
     @Published var language: String {
@@ -52,6 +68,7 @@ final class AppModel: ObservableObject {
     let manager: AppServerManager
     private let reader: SQLiteReader
     private let engine: AutoContinueEngine
+    private let idleSleepManager = IdleSleepManager()
     private var client: AppServerClient?
     private var timer: Timer?
     /// 记录上一次是否处于「已到上限」状态，用于恢复检测
@@ -65,6 +82,7 @@ final class AppModel: ObservableObject {
         self.engine = AutoContinueEngine(codexHome: codexHome)
         self.selectedThreadIds = Set(UserDefaults.standard.stringArray(forKey: "selectedThreadIds") ?? [])
         self.autoContinue = UserDefaults.standard.object(forKey: "autoContinue") as? Bool ?? true
+        self.keepAwakeForSelectedTasks = UserDefaults.standard.bool(forKey: "keepAwakeForSelectedTasks")
         self.continueCommand = UserDefaults.standard.string(forKey: "continueCommand") ?? L("继续", "Continue")
         self.remoteControlEnabled = CodexConfig.load(codexHome: codexHome).remoteControlEnabled
         self.language = UserDefaults.standard.string(forKey: "language") ?? "system"
@@ -168,12 +186,14 @@ final class AppModel: ObservableObject {
 
     /// 退出：清理自起的 app-server 子进程
     func quit() {
+        idleSleepManager.stop()
         manager.stopOwnServer()
         NSApp.terminate(nil)
     }
 
     /// 收到终止信号时的清理（launchd 停止 / kill）
     func stopAndExit() {
+        idleSleepManager.stop()
         manager.stopOwnServer()
         exit(0)
     }
@@ -341,6 +361,35 @@ final class AppModel: ObservableObject {
     /// 刷新暂停对话列表（不自动勾选；勾选完全由用户控制）
     func refreshPausedThreads() {
         pausedThreads = reader.usageLimitedThreads()
+        updateIdleSleepPrevention()
+    }
+
+    /// Assert only when an opted-in selected chat has a pending quota failure or
+    /// an active turn; release automatically on completion/deselection/disable.
+    private func updateIdleSleepPrevention() {
+        let monitoring = keepAwakeForSelectedTasks && autoContinue && !selectedThreadIds.isEmpty
+        let hasPendingFailure = monitoring && pausedThreads.contains {
+            selectedThreadIds.contains($0.threadId)
+        }
+        let hasRunningTurn = monitoring &&
+            !reader.activeThreadIds(for: selectedThreadIds).isEmpty
+        let shouldPrevent = IdleSleepPolicy.shouldPreventIdleSleep(
+            enabled: keepAwakeForSelectedTasks,
+            autoContinueEnabled: autoContinue,
+            hasSelectedQuotaFailure: hasPendingFailure,
+            hasSelectedRunningTurn: hasRunningTurn,
+            isSendingContinue: isWorking && !selectedThreadIds.isEmpty
+        )
+        guard idleSleepManager.setActive(shouldPrevent) else { return }
+        idleSleepPreventionActive = idleSleepManager.isActive
+        appendLog(
+            shouldPrevent
+                ? "已阻止 Mac 因空闲进入睡眠（已勾选任务等待恢复或正在执行）"
+                : "已释放防空闲睡眠限制（没有需要等待或执行的已勾选任务）",
+            shouldPrevent
+                ? "Preventing idle system sleep for a selected waiting or running task"
+                : "Released idle sleep protection; no selected task requires it"
+        )
     }
 
     /// 刷新「全部对话」列表（面板每次打开时调用）
