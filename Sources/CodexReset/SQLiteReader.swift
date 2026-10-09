@@ -13,6 +13,8 @@ struct PausedThread {
     let recoveryHint: String?
     /// 该失败轮次时间（Unix 秒）
     let failedAt: Int
+    /// Identity of the latest usage-limited failed turn (nil for non-paused threads).
+    let failedTurnId: String?
 }
 
 final class SQLiteReader {
@@ -25,20 +27,20 @@ final class SQLiteReader {
     private var threadHistoryPath: String { codexHome + "/thread_history_1.sqlite" }
     private var stateDbPath: String { codexHome + "/state_5.sqlite" }
 
-    /// 找出所有因用量上限(usageLimitExceeded)失败暂停的线程（每线程取最新一次失败）。
+    /// 只将最新轮次因额度耗尽失败的线程视作暂停；忽略其后的成功/其他状态。
     /// thread_turns 中 turn_id 为 ULID，按 turn_id 倒序即按时间倒序。
-    func usageLimitedThreads(limit: Int = 20) -> [PausedThread] {
+    func usageLimitedThreads(limit: Int = 1000) -> [PausedThread] {
         guard let rows = queryRows(
             path: threadHistoryPath,
             sql: """
-            SELECT t.thread_id, t.error_json, t.started_at
+            SELECT t.thread_id, t.turn_id, t.error_json, t.started_at
             FROM thread_turns t
             JOIN (
-                SELECT thread_id, MAX(turn_id) AS max_turn
+                SELECT thread_id, MAX(turn_id) AS latest_turn
                 FROM thread_turns
-                WHERE status = 'failed' AND error_json LIKE '%usageLimitExceeded%'
                 GROUP BY thread_id
-            ) m ON t.thread_id = m.thread_id AND t.turn_id = m.max_turn
+            ) m ON t.thread_id = m.thread_id AND t.turn_id = m.latest_turn
+            WHERE t.status = 'failed' AND t.error_json LIKE '%usageLimitExceeded%'
             ORDER BY t.turn_id DESC
             LIMIT ?
             """,
@@ -48,16 +50,17 @@ final class SQLiteReader {
         var result: [PausedThread] = []
         for row in rows {
             let threadId = row[0] as? String ?? ""
-            let errorJson = row[1] as? String ?? ""
-            let failedAt = row[2] as? Int ?? 0
-            guard !threadId.isEmpty else { continue }
+            let failedTurnId = row[1] as? String ?? ""
+            let errorJson = row[2] as? String ?? ""
+            let failedAt = row[3] as? Int ?? 0
+            guard !threadId.isEmpty, !failedTurnId.isEmpty else { continue }
             // 过滤子代理线程（主对话派生的 subagent，非用户独立对话，无需单独继续）
             if isSubagentThread(threadId: threadId) { continue }
             let title = displayTitle(threadId: threadId, stateTitle: threadTitle(threadId: threadId))
             let cwd = threadCwd(threadId: threadId) ?? ""
             let hint = Self.extractRecoveryHint(from: errorJson)
             result.append(PausedThread(threadId: threadId, title: title, cwd: cwd,
-                                       recoveryHint: hint, failedAt: failedAt))
+                                       recoveryHint: hint, failedAt: failedAt, failedTurnId: failedTurnId))
         }
         return result
     }
@@ -81,7 +84,7 @@ final class SQLiteReader {
             guard !threadId.isEmpty else { continue }
             let title = displayTitle(threadId: threadId, stateTitle: rawTitle)
             result.append(PausedThread(threadId: threadId, title: title, cwd: cwd,
-                                       recoveryHint: nil, failedAt: updatedAt))
+                                       recoveryHint: nil, failedAt: updatedAt, failedTurnId: nil))
         }
         return result
     }
