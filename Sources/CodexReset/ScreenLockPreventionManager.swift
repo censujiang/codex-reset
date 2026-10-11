@@ -1,6 +1,13 @@
 import Foundation
 import IOKit.pwr_mgt
 
+/// A pure, testable policy for the experimental display assertion.
+enum ScreenLockPreventionPolicy {
+    static func shouldKeepDisplayAwake(enabled: Bool, workPending: Bool, locked: Bool) -> Bool {
+        enabled && workPending && !locked
+    }
+}
+
 /// An explicit opt-in, per-task attempt to postpone *automatic* screen locking.
 /// macOS does not expose a universal public "disable lock" assertion.
 /// Keeping the display awake plus renewing user activity helps with inactivity
