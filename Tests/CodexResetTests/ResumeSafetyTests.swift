@@ -126,6 +126,65 @@ final class ResumeSafetyTests: XCTestCase {
         XCTAssertFalse(reader.hasTurnAfter(threadId: "thread-a", failedTurnId: "002"))
     }
 
+    func testResumeRetriesVerifyEveryThirtySecondsAndCapAtThreeRetries() {
+        let suite = "CodexResetRetryTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            XCTFail("Unable to create test defaults")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let tracker = ResumeRetryTracker(defaults: defaults)
+        let base = Date(timeIntervalSince1970: 100000)
+
+        XCTAssertEqual(tracker.decision(threadId: "thread", failedTurnId: "limit1", now: base),
+                       .ready(attempt: 1))
+        for attempt in 1...ResumeRetryTracker.maxAttempts {
+            let sentAt = base.addingTimeInterval(Double(attempt - 1) * 30)
+            XCTAssertEqual(tracker.decision(threadId: "thread", failedTurnId: "limit1", now: sentAt),
+                           .ready(attempt: attempt))
+            XCTAssertEqual(tracker.recordAttempt(threadId: "thread", failedTurnId: "limit1", now: sentAt),
+                           attempt)
+            XCTAssertEqual(tracker.decision(threadId: "thread", failedTurnId: "limit1",
+                                           now: sentAt.addingTimeInterval(29)), .wait)
+        }
+        let expired = base.addingTimeInterval(120)
+        XCTAssertEqual(tracker.decision(threadId: "thread", failedTurnId: "limit1", now: expired),
+                       .exhausted)
+        XCTAssertTrue(tracker.markExhaustedNotified(threadId: "thread", failedTurnId: "limit1"))
+        XCTAssertFalse(tracker.markExhaustedNotified(threadId: "thread", failedTurnId: "limit1"))
+
+        let relaunched = ResumeRetryTracker(defaults: defaults)
+        XCTAssertEqual(relaunched.decision(threadId: "thread", failedTurnId: "limit1", now: expired),
+                       .exhausted)
+        XCTAssertEqual(relaunched.decision(threadId: "thread", failedTurnId: "limit2", now: expired),
+                       .ready(attempt: 1))
+        tracker.clear(threadId: "thread", failedTurnId: "limit1")
+        XCTAssertEqual(tracker.decision(threadId: "thread", failedTurnId: "limit1", now: expired),
+                       .ready(attempt: 1))
+    }
+
+    func testQuotaFailureConfirmationOnlyReturnsTrueForSameLatestFailure() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let dbPath = home.appendingPathComponent("thread_history_1.sqlite")
+        try executeSQL(at: dbPath, """
+            CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, status TEXT, error_json TEXT, started_at INTEGER);
+            INSERT INTO thread_turns VALUES ('thread-a', '001', 'failed', 'usageLimitExceeded', 1);
+            INSERT INTO thread_turns VALUES ('thread-b', '002', 'failed', 'someOtherError', 2);
+            """)
+        let reader = SQLiteReader(codexHome: home.path)
+        XCTAssertEqual(reader.isLatestQuotaFailure(threadId: "thread-a", failedTurnId: "001"), true)
+        XCTAssertEqual(reader.isLatestQuotaFailure(threadId: "thread-b", failedTurnId: "002"), false)
+        XCTAssertNil(reader.isLatestQuotaFailure(threadId: "unknown", failedTurnId: "001"))
+        try executeSQL(at: dbPath, """
+            INSERT INTO thread_turns VALUES ('thread-a', '003', 'inProgress', NULL, 3);
+            """)
+        XCTAssertEqual(reader.isLatestQuotaFailure(threadId: "thread-a", failedTurnId: "001"), false)
+        XCTAssertEqual(reader.isLatestQuotaFailure(threadId: "thread-a", failedTurnId: "003"), false)
+    }
+
     private func executeSQL(at url: URL, _ sql: String) throws {
         var db: OpaquePointer?
         guard sqlite3_open(url.path, &db) == SQLITE_OK, let db else {

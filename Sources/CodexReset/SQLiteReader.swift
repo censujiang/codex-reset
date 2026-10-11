@@ -65,6 +65,25 @@ final class SQLiteReader {
         return result
     }
 
+    /// Whether the supplied failed turn is STILL the thread's latest quota
+    /// failure. Nil means history could not be read reliably; never treat that
+    /// as recovery or use it to burn a retry.
+    func isLatestQuotaFailure(threadId: String, failedTurnId: String) -> Bool? {
+        guard let rows = queryRows(path: threadHistoryPath, sql: """
+            SELECT turn_id, status, error_json
+            FROM thread_turns
+            WHERE thread_id = ?
+            ORDER BY turn_id DESC
+            LIMIT 1
+            """, args: [threadId]),
+              let row = rows.first,
+              let latestTurnId = row[0] as? String,
+              let status = row[1] as? String else { return nil }
+        let error = row[2] as? String ?? ""
+        return latestTurnId == failedTurnId &&
+            status == "failed" && error.contains("usageLimitExceeded")
+    }
+
     /// Confirms that Codex persisted a turn newer than the quota-failed turn.
     /// Used to avoid treating an osascript exit code as proof of delivery.
     func hasTurnAfter(threadId: String, failedTurnId: String) -> Bool {

@@ -106,6 +106,19 @@ Then click the menu-bar icon to open the panel. Optionally:
 .build/release/CodexReset --continue <thread_id>     # resume one thread now
 ```
 
+## Verified retry behavior
+
+When quota usage becomes available, CodexReset sends one resume attempt to each selected thread whose latest turn is still `usageLimitExceeded`. It then waits **at least 30 seconds** and checks the local Codex history database:
+
+- If the latest turn is no longer the original quota-failed turn, recovery is confirmed and no more commands are sent.
+- If the same quota failure remains, CodexReset tries again after the verification interval: **one initial attempt plus at most three retries** (four attempts total).
+- If the history database cannot be read, it does not treat the absence of data as success and does not consume another retry.
+- Retry counts and verification deadlines are saved across restarts. A new quota-failed turn on the same conversation receives its own allowance.
+- A locked Mac defers GUI input without consuming a retry; app-server resumption is tried first. GUI automation is serialized across conversations to prevent clipboard/window focus races.
+- After the final attempt, one last 30-second verification happens. If the original error remains, the app stops retrying that failure and alerts the user.
+
+Retries are intentionally bounded because a successful transport acknowledgement is not proof that the Codex conversation advanced. Manual "Continue Now" remains available.
+
 ## Keep Mac awake while a selected task is pending (opt-in)
 
 In Settings (gear icon), turn on **Prevent sleep while waiting** / **等待恢复时防止睡眠**.

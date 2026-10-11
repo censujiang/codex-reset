@@ -76,6 +76,7 @@ final class AppModel: ObservableObject {
     let manager: AppServerManager
     private let reader: SQLiteReader
     private let engine: AutoContinueEngine
+    private let resumeRetries = ResumeRetryTracker()
     private let idleSleepManager = IdleSleepManager()
     private let screenLockPrevention = ScreenLockPreventionManager()
     private lazy var screenLockMonitor = ScreenLockMonitor { [weak self] in
@@ -465,24 +466,86 @@ final class AppModel: ObservableObject {
         wasLimited = isLimited
     }
 
-    /// Recheck on each usage poll so relaunching after a reset doesn't miss a pending failure.
-    /// A handled failure never runs twice; a later failure in the same thread can resume again.
+    /// A persisted submission is not necessarily an accepted Codex turn.
+    /// Every attempt is checked after 30 seconds. If the original quota error
+    /// remains the latest turn, retry up to three more times.
     func autoContinueIfNeeded() async {
-        guard autoContinue, !selectedThreadIds.isEmpty, !autoContinueRunning,
-              let rl = rateLimits, !isRateLimited(rl) else { return }
+        guard autoContinue, !selectedThreadIds.isEmpty, !autoContinueRunning else { return }
         autoContinueRunning = true
         defer { autoContinueRunning = false }
         refreshPausedThreads()
-        for paused in selectedTargets(onlyUsageLimited: true) {
-            if engine.alreadyHandled(paused.threadId, failedTurnId: paused.failedTurnId) {
-                continue
+
+        // Check all outstanding submissions, including those that were
+        // successful at the transport layer. Only SQLite's latest-turn state
+        // can confirm that an attempt actually progressed.
+        for entry in resumeRetries.trackedFailures {
+            // An app-server acknowledgement may precede SQLite persistence.
+            // Wait the full 30-second verification window before deciding.
+            guard Date() >= entry.verifyAfter else { continue }
+            guard let stillFailed = reader.isLatestQuotaFailure(
+                threadId: entry.threadId, failedTurnId: entry.failedTurnId
+            ) else { continue }
+            if !stillFailed {
+                resumeRetries.clear(threadId: entry.threadId, failedTurnId: entry.failedTurnId)
+                appendLog("已确认对话 \(entry.threadId) 离开额度失败状态（发送 \(entry.attempts) 次）",
+                          "Confirmed \(entry.threadId) left the quota-failed state (\(entry.attempts) attempts)")
             }
-            await continueOne(paused: paused, auto: true)
+        }
+
+        guard let rl = rateLimits, !isRateLimited(rl) else { return }
+        for paused in selectedTargets(onlyUsageLimited: true) {
+            guard let failedTurnId = paused.failedTurnId,
+                  reader.isLatestQuotaFailure(
+                      threadId: paused.threadId, failedTurnId: failedTurnId
+                  ) == true else { continue }
+
+            let decision = resumeRetries.decision(
+                threadId: paused.threadId, failedTurnId: failedTurnId
+            )
+            switch decision {
+            case .wait:
+                continue
+            case .exhausted:
+                if resumeRetries.markExhaustedNotified(
+                    threadId: paused.threadId, failedTurnId: failedTurnId
+                ) {
+                    appendLog("「\(paused.title)」恢复失败：已用完首次发送和 3 次重试，不再自动发送",
+                              "Resume exhausted for \(paused.title): initial attempt + 3 retries")
+                    notify(title: "Codex 自动恢复已停止",
+                           body: "「\(paused.title)」重试 3 次后仍显示额度不足，请手动检查")
+                }
+                continue
+            case .ready(let attempt):
+                if attempt > 1 {
+                    appendLog("30 秒后仍检测到「\(paused.title)」额度不足，准备第 \(attempt - 1)/3 次重试",
+                              "Quota failure remains after 30s; retry \(attempt - 1)/3 for \(paused.title)")
+                }
+                let outcome = await continueOne(paused: paused, auto: true)
+                switch outcome {
+                case .sent, .failed:
+                    // Count even a failed transport attempt so repeated API
+                    // failures cannot spam a conversation indefinitely.
+                    resumeRetries.recordAttempt(
+                        threadId: paused.threadId, failedTurnId: failedTurnId
+                    )
+                case .deferredLocked, .busy:
+                    // No GUI message was sent; preserve allowance for unlock.
+                    break
+                }
+            }
         }
     }
 
-    /// 对单个对话执行继续
-    private func continueOne(paused: PausedThread, auto: Bool) async {
+    private enum ResumeSubmission {
+        case sent
+        case failed
+        case deferredLocked
+        case busy
+    }
+
+    /// Serialize manual and automatic sends through the same engine instance.
+    private func continueOne(paused: PausedThread, auto: Bool) async -> ResumeSubmission {
+        guard !isWorking else { return .busy }
         isWorking = true
         appendLog("\(auto ? "自动" : "手动")继续：\(paused.title)",
                   "\(auto ? "Auto" : "Manual") continue: \(paused.title)")
@@ -493,15 +556,23 @@ final class AppModel: ObservableObject {
             command: continueCommand,
             fallbackToGUI: true
         )
+        let waitingForUnlock = engine.waitingForUnlock
         isWorking = false
         if ok {
-            notify(title: "Codex 已继续", body: "已对「\(paused.title)」发送「\(continueCommand)」")
-        } else if !engine.waitingForUnlock {
-            // Don't create a new failure notification on every 30-second poll
-            // while the session is merely locked; the pending turn is retained.
-            let reason = engine.lastFailureReason ?? "未知原因"
+            notify(title: "Codex 已发送恢复指令",
+                   body: "「\(paused.title)」30 秒后将检查额度失败状态")
+            return .sent
+        }
+        if waitingForUnlock {
+            return .deferredLocked
+        }
+        let reason = engine.lastFailureReason ?? "未知原因"
+        appendLog("续接未送达「\(paused.title)」：\(reason)",
+                  "Failed to deliver resume for \(paused.title): \(reason)")
+        if !auto {
             notify(title: "继续失败", body: "「\(paused.title)」\n\(reason)")
         }
+        return .failed
     }
 
     /// 手动立即继续：对所有勾选的对话（暂停 + 全部）执行继续

@@ -82,13 +82,20 @@ struct AppleScriptAutomation {
     }
 }
 
+/// Serializes clipboard, foreground window and keyboard operations.
+private actor SerializedGUIAutomation {
+    func sendContinue(threadId: String, command: String) throws {
+        try AppleScriptAutomation.sendContinue(threadId: threadId, command: command)
+    }
+}
+
 /// 自动继续引擎：
 /// - Path A（首选）：连接桌面 app 的 app-server（remote_control），thread/resume + turn/start("继续")
 /// - Path A 失效（无 socket / active writer / 未初始化）：回退 Path B（AppleScript GUI 自动化）
 final class AutoContinueEngine {
     let codexHome: String
-    /// 已处理过的线程，避免重复继续
-    private let handledFailures = HandledFailures()
+    /// GUI must never process two Codex conversations simultaneously.
+    private let guiSender = SerializedGUIAutomation()
 
     var onLog: ((String, String) -> Void)?
     /// 需要重启 Codex 以启用 remote_control 时的回调（用于弹通知引导）
@@ -101,10 +108,6 @@ final class AutoContinueEngine {
 
     init(codexHome: String) {
         self.codexHome = codexHome
-    }
-
-    func alreadyHandled(_ threadId: String, failedTurnId: String?) -> Bool {
-        handledFailures.contains(threadId: threadId, failedTurnId: failedTurnId)
     }
 
     /// 继续指定线程。返回是否成功。
@@ -121,7 +124,7 @@ final class AutoContinueEngine {
         // Path A1: 使用当前 app-server 客户端（优先桌面 control socket）
         if let client {
             if await tryContinueViaAppServer(client: client, threadId: threadId, command: command) {
-                handledFailures.record(threadId: threadId, failedTurnId: failedTurnId)
+                
                 return true
             } else {
                 lastError = "app-server 通道失败"
@@ -134,7 +137,7 @@ final class AutoContinueEngine {
             do {
                 try await desktopClient.initialize()
                 if await tryContinueViaAppServer(client: desktopClient, threadId: threadId, command: command) {
-                    handledFailures.record(threadId: threadId, failedTurnId: failedTurnId)
+                    
                     return true
                 }
                 lastError = "桌面 app-server 通道失败"
@@ -152,37 +155,13 @@ final class AutoContinueEngine {
                        "Mac is locked. Skipping GUI automation; will retry after unlock")
             } else if AppleScriptAutomation.hasAccessibilityPermission() {
                 do {
-                    try AppleScriptAutomation.sendContinue(threadId: threadId, command: command)
-                    // A zero osascript exit code only means the script ran. For
-                    // an auto-recovered failure, confirm Codex actually wrote a
-                    // newer turn before persisting the handled-failure record.
-                    if let failedTurnId, !failedTurnId.isEmpty {
-                        let reader = SQLiteReader(codexHome: codexHome)
-                        var confirmed = false
-                        for _ in 0..<12 {
-                            if reader.hasTurnAfter(threadId: threadId, failedTurnId: failedTurnId) {
-                                confirmed = true
-                                break
-                            }
-                            try? await Task.sleep(nanoseconds: 1_000_000_000)
-                        }
-                        if !confirmed {
-                            lastError = "GUI 指令尚未确认送达 Codex，将保留待续接状态"
-                            onLog?("GUI 自动化未检测到新轮次，不记录为已处理",
-                                   "GUI delivery unconfirmed (no newer turn); not marking handled")
-                        } else {
-                            handledFailures.record(threadId: threadId, failedTurnId: failedTurnId)
-                            onLog?("已确认 GUI 恢复产生新轮次",
-                                   "Confirmed GUI resume created a newer turn")
-                            return true
-                        }
-                    } else {
-                        // A manual one-off request has no failed-turn marker.
-                        // This preserves its previous best-effort GUI behavior.
-                        onLog?("已通过 GUI 自动化发送手动指令（未提供轮次 ID，无法校验）",
-                               "Sent manual GUI command (no failed turn ID to verify)")
-                        return true
-                    }
+                    try await guiSender.sendContinue(threadId: threadId, command: command)
+                    // A zero osascript exit code is not proof that Codex
+                    // accepted the message. The retry coordinator verifies
+                    // persisted quota-failure state after 30 seconds.
+                    onLog?("已执行 GUI 自动化，30 秒后确认限额状态",
+                           "GUI automation dispatched; verifying quota status after 30 seconds")
+                    return true
                 } catch {
                     lastError = "GUI 自动化失败: \(error)"
                 }
