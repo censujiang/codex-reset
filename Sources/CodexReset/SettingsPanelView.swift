@@ -100,6 +100,44 @@ struct SettingsPanelView: View {
             Divider()
                 .overlay(Color.black.opacity(0.05))
 
+            // A separate opt-in from idle-system-sleep protection. Intentionally
+            // makes the display stay awake while a selected task needs attention.
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(isOn: $model.preventAutomaticScreenLock) {
+                    Text(L("任务期间防止自动锁屏（实验性）",
+                           "Prevent automatic lock while working (experimental)"))
+                        .font(.subheadline)
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+
+                Text(L("有已勾选任务在等待额度或运行时，保持显示器唤醒并定期声明用户活动。任务结束后自动释放。",
+                       "Keep the display awake and renew user activity only while selected chats are waiting or running; release automatically afterward."))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if model.preventAutomaticScreenLock {
+                    Label(
+                        model.screenLockPreventionActive
+                            ? L("正在尝试阻止自动锁屏", "Trying to prevent automatic locking")
+                            : L("待命或当前已经锁屏", "Standby or screen already locked"),
+                        systemImage: model.screenLockPreventionActive ? "lock.open" : "lock"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(model.screenLockPreventionActive ? Color.green : Color.secondary)
+                }
+
+                Text(L("注意：可能持续亮屏、耗电并降低无人看管时的安全性。无法阻止手动锁屏、屏保或管理策略强制锁屏；锁屏后仍优先后台续接。",
+                       "Warning: the display may stay on, use more power and reduce unattended security. Manual locks, screen savers and managed policies may still lock; background resume is preferred."))
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+                .overlay(Color.black.opacity(0.05))
+
             // remote_control
             VStack(alignment: .leading, spacing: 3) {
                 Toggle(isOn: Binding(
