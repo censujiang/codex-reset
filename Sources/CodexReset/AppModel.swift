@@ -24,29 +24,37 @@ final class AppModel: ObservableObject {
     @Published var selectedThreadIds: Set<String> = [] {
         didSet {
             UserDefaults.standard.set(Array(selectedThreadIds), forKey: "selectedThreadIds")
-            updateIdleSleepPrevention()
+            updatePowerPrevention()
         }
     }
     @Published var logLines: [LogEntry] = []
     @Published var autoContinue: Bool {
         didSet {
             UserDefaults.standard.set(autoContinue, forKey: "autoContinue")
-            updateIdleSleepPrevention()
+            updatePowerPrevention()
         }
     }
     /// Optional, scoped idle-sleep protection. Off until the user opts in.
     @Published var keepAwakeForSelectedTasks: Bool {
         didSet {
             UserDefaults.standard.set(keepAwakeForSelectedTasks, forKey: "keepAwakeForSelectedTasks")
-            updateIdleSleepPrevention()
+            updatePowerPrevention()
         }
     }
     @Published private(set) var idleSleepPreventionActive = false
+    /// Experimental display and user-activity protection, opted in separately.
+    @Published var preventAutomaticScreenLock: Bool {
+        didSet {
+            UserDefaults.standard.set(preventAutomaticScreenLock, forKey: "preventAutomaticScreenLock")
+            updatePowerPrevention()
+        }
+    }
+    @Published private(set) var screenLockPreventionActive = false
     @Published var continueCommand: String {
         didSet { UserDefaults.standard.set(continueCommand, forKey: "continueCommand") }
     }
     @Published var isWorking = false {
-        didSet { updateIdleSleepPrevention() }
+        didSet { updatePowerPrevention() }
     }
     @Published var remoteControlEnabled: Bool
     /// 语言设置：system / zh / en（切换后写回 UserDefaults 并通过 objectWillChange 触发界面刷新）
@@ -69,6 +77,15 @@ final class AppModel: ObservableObject {
     private let reader: SQLiteReader
     private let engine: AutoContinueEngine
     private let idleSleepManager = IdleSleepManager()
+    private let screenLockPrevention = ScreenLockPreventionManager()
+    private lazy var screenLockMonitor = ScreenLockMonitor { [weak self] in
+        guard let self else { return }
+        self.updatePowerPrevention()
+        if !self.screenLockMonitor.isLocked {
+            // Retry an unverified GUI fallback immediately after unlocking.
+            self.refreshNow()
+        }
+    }
     private var client: AppServerClient?
     private var timer: Timer?
     /// 记录上一次是否处于「已到上限」状态，用于恢复检测
@@ -83,6 +100,7 @@ final class AppModel: ObservableObject {
         self.selectedThreadIds = Set(UserDefaults.standard.stringArray(forKey: "selectedThreadIds") ?? [])
         self.autoContinue = UserDefaults.standard.object(forKey: "autoContinue") as? Bool ?? true
         self.keepAwakeForSelectedTasks = UserDefaults.standard.bool(forKey: "keepAwakeForSelectedTasks")
+        self.preventAutomaticScreenLock = UserDefaults.standard.bool(forKey: "preventAutomaticScreenLock")
         self.continueCommand = UserDefaults.standard.string(forKey: "continueCommand") ?? L("继续", "Continue")
         self.remoteControlEnabled = CodexConfig.load(codexHome: codexHome).remoteControlEnabled
         self.language = UserDefaults.standard.string(forKey: "language") ?? "system"
@@ -186,6 +204,7 @@ final class AppModel: ObservableObject {
 
     /// 退出：清理自起的 app-server 子进程
     func quit() {
+        screenLockPrevention.stop()
         idleSleepManager.stop()
         manager.stopOwnServer()
         NSApp.terminate(nil)
@@ -193,6 +212,7 @@ final class AppModel: ObservableObject {
 
     /// 收到终止信号时的清理（launchd 停止 / kill）
     func stopAndExit() {
+        screenLockPrevention.stop()
         idleSleepManager.stop()
         manager.stopOwnServer()
         exit(0)
@@ -361,35 +381,46 @@ final class AppModel: ObservableObject {
     /// 刷新暂停对话列表（不自动勾选；勾选完全由用户控制）
     func refreshPausedThreads() {
         pausedThreads = reader.usageLimitedThreads()
-        updateIdleSleepPrevention()
+        updatePowerPrevention()
     }
 
-    /// Assert only when an opted-in selected chat has a pending quota failure or
-    /// an active turn; release automatically on completion/deselection/disable.
-    private func updateIdleSleepPrevention() {
-        let monitoring = keepAwakeForSelectedTasks && autoContinue && !selectedThreadIds.isEmpty
+    /// Reconcile the two independent, opt-in power assertions every poll and
+    /// immediately after selection, settings, or interactive lock state changes.
+    private func updatePowerPrevention() {
+        let monitoring = autoContinue && !selectedThreadIds.isEmpty &&
+            (keepAwakeForSelectedTasks || preventAutomaticScreenLock)
         let hasPendingFailure = monitoring && pausedThreads.contains {
             selectedThreadIds.contains($0.threadId)
         }
         let hasRunningTurn = monitoring &&
             !reader.activeThreadIds(for: selectedThreadIds).isEmpty
-        let shouldPrevent = IdleSleepPolicy.shouldPreventIdleSleep(
-            enabled: keepAwakeForSelectedTasks,
+        let required = IdleSleepPolicy.shouldPreventIdleSleep(
+            enabled: monitoring,
             autoContinueEnabled: autoContinue,
             hasSelectedQuotaFailure: hasPendingFailure,
             hasSelectedRunningTurn: hasRunningTurn,
             isSendingContinue: isWorking && !selectedThreadIds.isEmpty
         )
-        guard idleSleepManager.setActive(shouldPrevent) else { return }
-        idleSleepPreventionActive = idleSleepManager.isActive
-        appendLog(
-            shouldPrevent
-                ? "已阻止 Mac 因空闲进入睡眠（已勾选任务等待恢复或正在执行）"
-                : "已释放防空闲睡眠限制（没有需要等待或执行的已勾选任务）",
-            shouldPrevent
-                ? "Preventing idle system sleep for a selected waiting or running task"
-                : "Released idle sleep protection; no selected task requires it"
-        )
+        let systemRequired = required && keepAwakeForSelectedTasks
+        if idleSleepManager.setActive(systemRequired) {
+            idleSleepPreventionActive = idleSleepManager.isActive
+            appendLog(
+                systemRequired ? "已阻止系统空闲睡眠" : "已释放系统防睡眠限制",
+                systemRequired ? "Idle system sleep prevented" : "Idle system sleep protection released"
+            )
+        }
+
+        // Never try to wake or unlock a session locked intentionally by the user.
+        let displayRequired = required && preventAutomaticScreenLock && !screenLockMonitor.isLocked
+        if screenLockPrevention.setActive(displayRequired) {
+            screenLockPreventionActive = screenLockPrevention.isActive
+            appendLog(
+                displayRequired ? "已启用实验性防自动锁屏（显示器可能持续点亮）" : "已释放实验性防自动锁屏",
+                displayRequired ? "Experimental automatic screen-lock prevention active" : "Automatic screen-lock prevention released"
+            )
+        } else if displayRequired {
+            screenLockPrevention.renewUserActivity()
+        }
     }
 
     /// 刷新「全部对话」列表（面板每次打开时调用）
