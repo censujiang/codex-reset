@@ -65,6 +65,16 @@ final class SQLiteReader {
         return result
     }
 
+    /// Confirms that Codex persisted a turn newer than the quota-failed turn.
+    /// Used to avoid treating an osascript exit code as proof of delivery.
+    func hasTurnAfter(threadId: String, failedTurnId: String) -> Bool {
+        guard let row = queryRow(path: threadHistoryPath, sql: """
+            SELECT MAX(turn_id) FROM thread_turns WHERE thread_id = ?
+            """, args: [threadId]),
+              let latestTurnId = row[0] as? String else { return false }
+        return latestTurnId > failedTurnId
+    }
+
     /// Find selected conversations whose latest turn is still executing.
     /// Query in batches to stay below SQLite's bind-parameter limit.
     func activeThreadIds(for threadIds: Set<String>) -> Set<String> {
