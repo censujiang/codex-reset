@@ -411,7 +411,11 @@ final class AppModel: ObservableObject {
         }
 
         // Never try to wake or unlock a session locked intentionally by the user.
-        let displayRequired = required && preventAutomaticScreenLock && !screenLockMonitor.isLocked
+        let displayRequired = ScreenLockPreventionPolicy.shouldKeepDisplayAwake(
+            enabled: preventAutomaticScreenLock,
+            workPending: required,
+            locked: screenLockMonitor.isLocked
+        )
         if screenLockPrevention.setActive(displayRequired) {
             screenLockPreventionActive = screenLockPrevention.isActive
             appendLog(
