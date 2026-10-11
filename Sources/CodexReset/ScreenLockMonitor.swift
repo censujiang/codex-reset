@@ -32,7 +32,7 @@ final class ScreenLockMonitor {
         Self.isSessionLocked(notificationLocked: notificationLocked)
     }
 
-    static func isSessionLocked(notificationLocked: Bool? = nil) -> Bool {
+    nonisolated static func isSessionLocked(notificationLocked: Bool? = nil) -> Bool {
         // If the WindowServer session is not available, GUI input is unsafe.
         guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else {
             return true
