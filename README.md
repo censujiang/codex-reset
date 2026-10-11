@@ -117,6 +117,14 @@ In Settings (gear icon), turn on **Prevent sleep while waiting** / **等待恢�
 
 The setting does not change system-wide macOS sleep preferences; it uses a temporary per-process activity.
 
+## Experimental automatic screen-lock prevention
+
+In Settings, **Prevent automatic lock while working (experimental)** is an independent option from "Prevent sleep while waiting", and is **off by default**.
+
+When an opted-in, selected chat is waiting for a quota reset or executing, CodexReset holds a macOS display-awake activity and periodically declares user activity. This may help postpone inactivity-triggered locking, but **macOS has no public universal lock-prevention guarantee**: screen savers, organizational security policy, explicit Lock Screen, and closing the MacBook lid can still lock the session. The screen may remain on, consuming more power and reducing unattended-device security. No system password or security preference is modified.
+
+The auto-resume fallback is also lock-aware: the local app-server channel is tried before GUI automation; if the screen is locked, no synthetic clicks or keystrokes are attempted. On unlock, pending tasks are checked again. After a GUI fallback, an automatic resume is only marked handled if a newer turn is observed in the local Codex history database. If it is not confirmed within the verification window, it remains pending for retry (a late database write could cause a duplicate; consider using the app-server channel for stronger confirmation).
+
 ## Configuration
 
 | Setting | Where |
