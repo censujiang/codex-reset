@@ -6,6 +6,9 @@ import ApplicationServices
 /// 依赖辅助功能权限（System Events）。
 struct AppleScriptAutomation {
     static func sendContinue(threadId: String, command: String) throws {
+        guard !ScreenLockMonitor.isSessionLocked() else {
+            throw JSONRPCError(code: -1, message: "屏幕已锁定，禁止模拟输入", data: nil)
+        }
         let escaped = command
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
@@ -14,6 +17,9 @@ struct AppleScriptAutomation {
             NSWorkspace.shared.open(url)
         }
         Thread.sleep(forTimeInterval: 3.0)
+        guard !ScreenLockMonitor.isSessionLocked() else {
+            throw JSONRPCError(code: -1, message: "等待 Codex 打开期间发生锁屏", data: nil)
+        }
         // 2) 激活 Codex（进程名为 ChatGPT）→ 点击输入框确保焦点 → 粘贴「继续」→ Cmd+Enter 发送
         //    关键：必须先点击输入框，否则 keystroke v 会粘贴到当前焦点（可能是对话列表）而静默失效
         let script = """
@@ -91,6 +97,7 @@ final class AutoContinueEngine {
     var onNeedAccessibility: (() -> Void)?
     /// 最近一次继续失败的原因
     private(set) var lastFailureReason: String?
+    private(set) var waitingForUnlock = false
 
     init(codexHome: String) {
         self.codexHome = codexHome
@@ -109,6 +116,7 @@ final class AutoContinueEngine {
     func continueThread(client: AppServerClient?, threadId: String, failedTurnId: String? = nil, command: String, fallbackToGUI: Bool) async -> Bool {
         var lastError = "无可用连接"
         lastFailureReason = nil
+        waitingForUnlock = false
 
         // Path A1: 使用当前 app-server 客户端（优先桌面 control socket）
         if let client {
@@ -135,26 +143,56 @@ final class AutoContinueEngine {
             }
         }
 
-        // Path B: GUI 自动化回退
+        // Path B: never send fake keyboard input to a locked macOS session.
         if fallbackToGUI {
-            if AppleScriptAutomation.hasAccessibilityPermission() {
+            if ScreenLockMonitor.isSessionLocked() {
+                waitingForUnlock = true
+                lastError = "Mac 已锁屏，后台通道不可用；保留任务等待解锁后重试"
+                onLog?("Mac 已锁屏，跳过 GUI 自动化；解锁后将重试",
+                       "Mac is locked. Skipping GUI automation; will retry after unlock")
+            } else if AppleScriptAutomation.hasAccessibilityPermission() {
                 do {
                     try AppleScriptAutomation.sendContinue(threadId: threadId, command: command)
-                    onLog?("已通过 GUI 自动化发送「\(command)」（深链打开对话并粘贴）",
-                           "Sent \"\(command)\" via GUI automation (deep-linked into the chat and pasted)")
-                    handledFailures.record(threadId: threadId, failedTurnId: failedTurnId)
-                    return true
+                    // A zero osascript exit code only means the script ran. For
+                    // an auto-recovered failure, confirm Codex actually wrote a
+                    // newer turn before persisting the handled-failure record.
+                    if let failedTurnId, !failedTurnId.isEmpty {
+                        let reader = SQLiteReader(codexHome: codexHome)
+                        var confirmed = false
+                        for _ in 0..<12 {
+                            if reader.hasTurnAfter(threadId: threadId, failedTurnId: failedTurnId) {
+                                confirmed = true
+                                break
+                            }
+                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        }
+                        if !confirmed {
+                            lastError = "GUI 指令尚未确认送达 Codex，将保留待续接状态"
+                            onLog?("GUI 自动化未检测到新轮次，不记录为已处理",
+                                   "GUI delivery unconfirmed (no newer turn); not marking handled")
+                        } else {
+                            handledFailures.record(threadId: threadId, failedTurnId: failedTurnId)
+                            onLog?("已确认 GUI 恢复产生新轮次",
+                                   "Confirmed GUI resume created a newer turn")
+                            return true
+                        }
+                    } else {
+                        // A manual one-off request has no failed-turn marker.
+                        // This preserves its previous best-effort GUI behavior.
+                        onLog?("已通过 GUI 自动化发送手动指令（未提供轮次 ID，无法校验）",
+                               "Sent manual GUI command (no failed turn ID to verify)")
+                        return true
+                    }
                 } catch {
                     lastError = "GUI 自动化失败: \(error)"
                 }
             } else {
                 let config = CodexConfig.load(codexHome: codexHome)
                 if config.remoteControlEnabled {
-                    // remote_control 已启用但 Codex 未重启（control socket 未出现）→ 引导重启 Codex
-                    lastError = "辅助功能授权未生效，且 remote_control 已启用但 Codex 未重启。请重启 Codex 桌面 app，之后将走官方协议通道（无需辅助功能权限）；若仍要使用辅助功能，请在系统设置重新勾选授权（注意：重新打包会改变签名导致授权失效）"
+                    lastError = "辅助功能未授权，且 remote_control 未正常连接。请重启 Codex 桌面 app，或重新授权辅助功能"
                     onNeedRestartCodex?()
                 } else {
-                    lastError = "辅助功能未授权，无法在 Codex 中输入。请在面板「辅助功能」状态点「授权」勾选本 App（若勾选过仍提示，请重新勾选一次）"
+                    lastError = "辅助功能未授权，无法在 Codex 中输入。请在系统设置为本 App 授权辅助功能"
                     onNeedAccessibility?()
                 }
             }
