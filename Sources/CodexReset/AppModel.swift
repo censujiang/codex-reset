@@ -79,11 +79,14 @@ final class AppModel: ObservableObject {
     private let idleSleepManager = IdleSleepManager()
     private let screenLockPrevention = ScreenLockPreventionManager()
     private lazy var screenLockMonitor = ScreenLockMonitor { [weak self] in
-        guard let self else { return }
-        self.updatePowerPrevention()
-        if !self.screenLockMonitor.isLocked {
+        self?.handleScreenLockStateChange()
+    }
+
+    private func handleScreenLockStateChange() {
+        updatePowerPrevention()
+        if !screenLockMonitor.isLocked {
             // Retry an unverified GUI fallback immediately after unlocking.
-            self.refreshNow()
+            refreshNow()
         }
     }
     private var client: AppServerClient?
