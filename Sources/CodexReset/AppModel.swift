@@ -489,8 +489,9 @@ final class AppModel: ObservableObject {
         isWorking = false
         if ok {
             notify(title: "Codex 已继续", body: "已对「\(paused.title)」发送「\(continueCommand)」")
-        } else {
-            // 手动/自动失败都要明确反馈（辅助功能引导走 engine.onNeedAccessibility 通知，不自动弹系统设置）
+        } else if !engine.waitingForUnlock {
+            // Don't create a new failure notification on every 30-second poll
+            // while the session is merely locked; the pending turn is retained.
             let reason = engine.lastFailureReason ?? "未知原因"
             notify(title: "继续失败", body: "「\(paused.title)」\n\(reason)")
         }
