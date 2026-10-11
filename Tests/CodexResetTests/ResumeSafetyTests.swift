@@ -89,6 +89,43 @@ final class ResumeSafetyTests: XCTestCase {
         XCTAssertEqual(reader.activeThreadIds(for: []), [])
     }
 
+    func testExperimentalScreenLockProtectionIsOptInAndRespectsLock() {
+        XCTAssertFalse(ScreenLockPreventionPolicy.shouldKeepDisplayAwake(
+            enabled: false, workPending: true, locked: false
+        ))
+        XCTAssertFalse(ScreenLockPreventionPolicy.shouldKeepDisplayAwake(
+            enabled: true, workPending: false, locked: false
+        ))
+        XCTAssertFalse(ScreenLockPreventionPolicy.shouldKeepDisplayAwake(
+            enabled: true, workPending: true, locked: true
+        ))
+        XCTAssertTrue(ScreenLockPreventionPolicy.shouldKeepDisplayAwake(
+            enabled: true, workPending: true, locked: false
+        ))
+    }
+
+    func testGUIConfirmationRequiresANewerPersistedTurn() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let dbPath = home.appendingPathComponent("thread_history_1.sqlite")
+        try executeSQL(at: dbPath, """
+            CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, status TEXT, error_json TEXT, started_at INTEGER);
+            INSERT INTO thread_turns VALUES ('thread-a', '001', 'failed', 'usageLimitExceeded', 1);
+            INSERT INTO thread_turns VALUES ('thread-b', '003', 'completed', NULL, 3);
+            """)
+        let reader = SQLiteReader(codexHome: home.path)
+        XCTAssertFalse(reader.hasTurnAfter(threadId: "thread-a", failedTurnId: "001"))
+        XCTAssertFalse(reader.hasTurnAfter(threadId: "missing", failedTurnId: "001"))
+        XCTAssertFalse(reader.hasTurnAfter(threadId: "thread-a", failedTurnId: "002"))
+        try executeSQL(at: dbPath, """
+            INSERT INTO thread_turns VALUES ('thread-a', '002', 'inProgress', NULL, 2);
+            """)
+        XCTAssertTrue(reader.hasTurnAfter(threadId: "thread-a", failedTurnId: "001"))
+        XCTAssertFalse(reader.hasTurnAfter(threadId: "thread-a", failedTurnId: "002"))
+    }
+
     private func executeSQL(at url: URL, _ sql: String) throws {
         var db: OpaquePointer?
         guard sqlite3_open(url.path, &db) == SQLITE_OK, let db else {
